@@ -17,6 +17,12 @@ struct Offering {
 }
 
 #[derive(Deserialize, Debug)]
+struct StatusCode {
+    code: u64,
+    message: String,
+}
+
+#[derive(Deserialize, Debug)]
 struct Slot {
     slot: String,
 }
@@ -81,6 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn check_offerings(
     notification_map: &mut HashMap<u64, HashSet<String>>,
 ) -> Result<Option<Vec<Appointment>>, Box<dyn std::error::Error>> {
+    // Map to swap with old entries e.g. [1,2,3] -> [1,2] -> [1,2,3] => Notify again
+    let mut notification_map_new = HashMap::new();
     let mut appointments = Vec::new();
 
     let offerings =
@@ -95,19 +103,23 @@ async fn check_offerings(
         }
         println!("Checking {}", offering.title);
 
-        let slots = match reqwest::get(format!(
+        // Also possible: {"code":2000,"message":"There are no open slots, because all slots have been booked already."}
+
+        let slots: Vec<Slot> = match reqwest::get(format!(
             "https://booking-service.jameda.de/public/resources/81229096/slots?serviceId={}",
             offering.id
         ))
         .await?
-        .json::<Vec<Slot>>()
+        .text()
         .await {
-            Ok(slots) => {
-                if slots.is_empty() {
-                    println!("No available slots. Skip");
-                    continue;
-                } else {
-                    slots
+            Ok(response_string) => {
+                match serde_json::from_str(&response_string) {
+                    Ok(slots) => slots,
+                    Err(_) => {
+                        let status: StatusCode = serde_json::from_str(&response_string)?;
+                        println!("{:?}", status);
+                        continue;
+                    }
                 }
             },
             Err(e) => {
@@ -130,8 +142,14 @@ async fn check_offerings(
                 .or_insert_with(HashSet::new);
             if notification_entries.insert(date.clone()) {
                 // Wasn't reported yet, add it
-                appointment.dates.push(date);
+                appointment.dates.push(date.clone());
             }
+
+            notification_map_new.entry(appointment.id).or_insert_with(|| {
+                let mut set = HashSet::new();
+                set.insert(date.clone());
+                set
+            });
         }
 
         // Only add Appointments where at least one date is available and not reported yet
@@ -139,6 +157,8 @@ async fn check_offerings(
             appointments.push(appointment);
         }
     }
+
+    *notification_map = notification_map_new;
 
     if appointments.is_empty() {
         Ok(None)
@@ -151,6 +171,8 @@ async fn notify(appointments: &[Appointment], config: &NotificationConfig, clien
     let text = appointments.iter().map(|a| {
         format!("{}: {}", a.title, a.dates.join(","))
     }).collect::<Vec<String>>().join("\n");
+
+    println!("{}", text);
 
     match client
         .post(format!("https://api.telegram.org/bot{}/sendMessage", config.telegram_token))
