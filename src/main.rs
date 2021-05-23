@@ -1,4 +1,7 @@
+use chrono::Timelike;
 use rand::Rng;
+use reqwest::header;
+use reqwest::header::HeaderValue;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -11,7 +14,20 @@ struct NotificationConfig {
 }
 
 #[derive(Deserialize, Debug)]
-struct Offering {
+struct DoctorInfoResult {
+    results: Vec<DoctorInfo>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DoctorInfo {
+    ref_id: String,
+    name_kurz: String,
+    entfernung: f64,
+    services: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Service {
     id: u64,
     title: String,
 }
@@ -29,16 +45,28 @@ struct Slot {
 
 #[derive(Debug)]
 struct Appointment {
-    id: u64,
-    title: String,
+    doc_id: String,
+    doc_name: String,
+    distance: f64,
+    service_id: u64,
+    service_title: String,
     dates: Vec<String>,
 }
 
 impl Appointment {
-    pub fn new(id: u64, title: String) -> Self {
+    pub fn new(
+        doc_id: String,
+        doc_name: String,
+        distance: f64,
+        service_id: u64,
+        service_title: String,
+    ) -> Self {
         Appointment {
-            id,
-            title,
+            doc_id,
+            doc_name,
+            distance,
+            service_id,
+            service_title,
             dates: Vec::new(),
         }
     }
@@ -48,25 +76,35 @@ impl Appointment {
     }
 }
 
-impl From<Offering> for Appointment {
-    fn from(offering: Offering) -> Self {
-        Self::new(offering.id, offering.title)
-    }
-}
+type Date = String;
+type ServiceMap = HashMap<u64, HashSet<Date>>;
+type DoctorMap = HashMap<String, ServiceMap>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Version V0.0.3");
+    dotenv::dotenv().ok();
 
     let config = NotificationConfig {
         telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID must be set"),
         telegram_token: std::env::var("TELEGRAM_TOKEN").expect("TELEGRAM_TOKEN must be set"),
     };
 
-    let client = reqwest::Client::new();
-    let mut notification_map: HashMap<u64, HashSet<String>> = HashMap::new();
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0",
+        ),
+    );
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+
+    let mut doctor_map: DoctorMap = HashMap::new();
     loop {
-        match check_offerings(&mut notification_map).await {
+        match check_services(&client, &mut doctor_map).await {
             Ok(option) => match option {
                 None => {
                     println!("Nothing new...");
@@ -79,85 +117,141 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Error: {:?}", e);
             }
         }
-        let random_sec = rand::thread_rng().gen_range(180..600);
+        let hour = chrono::Utc::now().hour();
+        let random_sec = if hour >= 22 || hour <= 3 {
+            rand::thread_rng().gen_range(20 * 60..50 * 60)
+        } else {
+            rand::thread_rng().gen_range(5 * 60..10 * 60)
+        };
         sleep(Duration::from_secs(random_sec)).await;
     }
 }
 
-async fn check_offerings(
-    notification_map: &mut HashMap<u64, HashSet<String>>,
+async fn check_services(
+    client: &Client,
+    notification_map: &mut DoctorMap,
 ) -> Result<Option<Vec<Appointment>>, Box<dyn std::error::Error>> {
-    // Map to swap with old entries e.g. [1,2,3] -> [1,2] -> [1,2,3] => Notify again
-    let mut notification_map_new = HashMap::new();
     let mut appointments = Vec::new();
+    let mut notification_map_new = HashMap::new();
 
-    let offerings =
-        reqwest::get("https://booking-service.jameda.de/public/resources/81229096/services")
-            .await?
-            .json::<Vec<Offering>>()
-            .await?;
+    let relevant_doctor_info = client.get("https://www.jameda.de/heidelberg/corona-impftermine/spezialisten/?ajaxparams[]=change%7Cgeoball%7C49.39875_8.672434_100&output=json")
+        .send()
+        .await?
+        .json::<DoctorInfoResult>()
+        .await?;
 
-    for offering in offerings {
-        if !offering.title.to_lowercase().contains("impfung") {
+    for doctor_info in relevant_doctor_info.results {
+        if !doctor_info.services.contains(&"Corona-Impfung".to_owned()) {
             continue;
         }
-        println!("Checking {}", offering.title);
 
-        // Also possible: {"code":2000,"message":"There are no open slots, because all slots have been booked already."}
-
-        let slots: Vec<Slot> = match reqwest::get(format!(
-            "https://booking-service.jameda.de/public/resources/81229096/slots?serviceId={}",
-            offering.id
-        ))
-        .await?
-        .text()
-        .await {
-            Ok(response_string) => {
-                match serde_json::from_str(&response_string) {
-                    Ok(slots) => slots,
-                    Err(_) => {
-                        let status: StatusCode = serde_json::from_str(&response_string)?;
-                        println!("{:?}", status);
-                        continue;
-                    }
-                }
-            },
-            Err(e) => {
-                println!("Skipping due to error {:?}", e);
+        let services = match client
+            .get(format!(
+                "https://booking-service.jameda.de/public/resources/{}/services",
+                doctor_info.ref_id
+            ))
+            .send()
+            .await?
+            .json::<Vec<Service>>()
+            .await
+        {
+            Ok(srv) => srv,
+            Err(_) => {
+                // The specified refId (1234) does not have OTB available.
+                println!(
+                    "Skipping {}, no appointment bookable",
+                    doctor_info.name_kurz
+                );
                 continue;
             }
         };
 
-        // Format is 2021-05-29T10:15:00+02:00
-        let dates = slots
-            .into_iter()
-            .map(|s| s.slot[..s.slot.find('T').unwrap_or_else(|| s.slot.len())].to_owned())
-            .collect::<BTreeSet<String>>();
+        for service in services {
+            if !service.title.to_lowercase().contains("impfung")
+                || service.title.to_lowercase().contains("zweit")
+            {
+                continue;
+            }
+            // Be nice and slow down
+            sleep(Duration::from_millis(2000)).await;
+            println!(
+                "Checking {} from {} ({}km)",
+                service.title, doctor_info.name_kurz, doctor_info.entfernung
+            );
 
-        let mut appointment: Appointment = offering.into();
-        for date in dates {
-            // Check if the date for the offering/appointment id was already reported as available, if not, add it
-            let notification_entries = notification_map
-                .entry(appointment.id)
-                .or_insert_with(HashSet::new);
-            if notification_entries.insert(date.clone()) {
-                // Wasn't reported yet, add it
-                appointment.dates.push(date.clone());
+            // Also possible: {"code":2000,"message":"There are no open slots, because all slots have been booked already."}
+            let slots: Vec<Slot> = match client
+                .get(format!(
+                    "https://booking-service.jameda.de/public/resources/{}/slots?serviceId={}",
+                    doctor_info.ref_id, service.id
+                ))
+                .send()
+                .await?
+                .text()
+                .await
+            {
+                Ok(response_string) => match serde_json::from_str(&response_string) {
+                    Ok(slots) => slots,
+                    Err(e) => {
+                        let status: StatusCode =
+                            serde_json::from_str(&response_string).unwrap_or(StatusCode {
+                                code: 500,
+                                message: e.to_string(),
+                            });
+                        println!("{:?}", status);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    println!("Skipping due to error {:?}", e);
+                    continue;
+                }
+            };
+
+            // Format is 2021-05-29T10:15:00+02:00
+            let dates = slots
+                .into_iter()
+                .map(|s| s.slot[..s.slot.find('T').unwrap_or_else(|| s.slot.len())].to_owned())
+                .collect::<BTreeSet<String>>();
+
+            let mut appointment = Appointment::new(
+                doctor_info.ref_id.clone(),
+                doctor_info.name_kurz.to_owned(),
+                doctor_info.entfernung,
+                service.id,
+                service.title,
+            );
+            for date in dates {
+                // Check if the date for the service/appointment id was already reported as available, if not, add it
+                let notification_entries = notification_map
+                    .entry(doctor_info.ref_id.clone())
+                    .or_insert_with(HashMap::new)
+                    .entry(appointment.service_id)
+                    .or_insert_with(HashSet::new);
+                if notification_entries.insert(date.clone()) {
+                    // Wasn't reported yet, add it
+                    appointment.dates.push(date.clone());
+                }
+
+                notification_map_new
+                    .entry(doctor_info.ref_id.clone())
+                    .or_insert_with(HashMap::new)
+                    .entry(appointment.service_id)
+                    .or_insert_with(|| {
+                        let mut set = HashSet::new();
+                        set.insert(date.clone());
+                        set
+                    });
             }
 
-            notification_map_new.entry(appointment.id).or_insert_with(|| {
-                let mut set = HashSet::new();
-                set.insert(date.clone());
-                set
-            });
-        }
-
-        // Only add Appointments where at least one date is available and not reported yet
-        if appointment.is_bookable() {
-            appointments.push(appointment);
+            // Only add Appointments where at least one date is available and not reported yet
+            if appointment.is_bookable() {
+                appointments.push(appointment);
+            }
         }
     }
 
+    // Set all found entries as old entries, so new ones can be reported
     *notification_map = notification_map_new;
 
     if appointments.is_empty() {
@@ -168,18 +262,28 @@ async fn check_offerings(
 }
 
 async fn notify(appointments: &[Appointment], config: &NotificationConfig, client: &Client) {
-    let text = appointments.iter().map(|a| {
-        format!("{}: {}", a.title, a.dates.join(","))
-    }).collect::<Vec<String>>().join("\n");
+    let text = appointments
+        .iter()
+        .map(|a| {
+            format!(
+                "{} ({}, {}km): {}",
+                a.service_title,
+                a.doc_name,
+                a.distance,
+                a.dates.join(",")
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
 
     println!("{}", text);
 
     match client
-        .post(format!("https://api.telegram.org/bot{}/sendMessage", config.telegram_token))
-        .query(&[
-            ("chat_id", &config.telegram_chat_id),
-            ("text", &text),
-        ])
+        .post(format!(
+            "https://api.telegram.org/bot{}/sendMessage",
+            config.telegram_token
+        ))
+        .query(&[("chat_id", &config.telegram_chat_id), ("text", &text)])
         .send()
         .await
     {
