@@ -21,7 +21,7 @@ struct DoctorInfoResult {
 #[derive(Deserialize, Debug)]
 struct DoctorInfo {
     ref_id: String,
-    name_kurz: String,
+    name_nice: String,
     entfernung: f64,
     services: Vec<String>,
 }
@@ -134,7 +134,14 @@ async fn check_services(
     let mut appointments = Vec::new();
     let mut notification_map_new = HashMap::new();
 
-    let relevant_doctor_info = client.get("https://www.jameda.de/heidelberg/corona-impftermine/spezialisten/?ajaxparams[]=change%7Cgeoball%7C49.39875_8.672434_100&output=json")
+    //https://www.jameda.de/heidelberg/corona-impftermine/spezialisten/?ajaxparams[0]=add|popular|otb_status&ajaxparams[1]=change|geoball|49.39875_8.672434_100&output=json
+    let relevant_doctor_info = client
+        .get("https://www.jameda.de/heidelberg/corona-impftermine/spezialisten/")
+        .query(&[
+            ("ajaxparams[0]", "add|popular|otb_status"),
+            ("ajaxparams[1]", "change|geoball|49.39875_8.672434_150"),
+            ("output", "json"),
+        ])
         .send()
         .await?
         .json::<DoctorInfoResult>()
@@ -160,7 +167,7 @@ async fn check_services(
                 // The specified refId (1234) does not have OTB available.
                 println!(
                     "Skipping {}, no appointment bookable",
-                    doctor_info.name_kurz
+                    doctor_info.name_nice
                 );
                 continue;
             }
@@ -176,7 +183,7 @@ async fn check_services(
             sleep(Duration::from_millis(2000)).await;
             println!(
                 "Checking {} from {} ({}km)",
-                service.title, doctor_info.name_kurz, doctor_info.entfernung
+                service.title, doctor_info.name_nice, doctor_info.entfernung
             );
 
             // Also possible: {"code":2000,"message":"There are no open slots, because all slots have been booked already."}
@@ -216,7 +223,7 @@ async fn check_services(
 
             let mut appointment = Appointment::new(
                 doctor_info.ref_id.clone(),
-                doctor_info.name_kurz.to_owned(),
+                doctor_info.name_nice.to_owned(),
                 doctor_info.entfernung,
                 service.id,
                 service.title,
@@ -241,7 +248,8 @@ async fn check_services(
                         let mut set = HashSet::new();
                         set.insert(date.clone());
                         set
-                    });
+                    })
+                    .insert(date.clone());
             }
 
             // Only add Appointments where at least one date is available and not reported yet
@@ -252,6 +260,8 @@ async fn check_services(
     }
 
     // Set all found entries as old entries, so new ones can be reported
+    println!("OLD: {:?}", notification_map);
+    println!("NEW: {:?}", notification_map_new);
     *notification_map = notification_map_new;
 
     if appointments.is_empty() {
@@ -276,7 +286,7 @@ async fn notify(appointments: &[Appointment], config: &NotificationConfig, clien
         .collect::<Vec<String>>()
         .join("\n");
 
-    println!("{}", text);
+    println!("Sending: {}", text);
 
     match client
         .post(format!(
