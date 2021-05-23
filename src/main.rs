@@ -2,10 +2,13 @@ use rand::Rng;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fmt::{Display, Formatter};
-use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 use tokio::time::sleep;
+
+struct NotificationConfig {
+    telegram_chat_id: String,
+    telegram_token: String,
+}
 
 #[derive(Deserialize, Debug)]
 struct Offering {
@@ -39,60 +42,19 @@ impl Appointment {
     }
 }
 
-impl Display for Appointment {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.title, self.dates.join(","))
-    }
-}
-
 impl From<Offering> for Appointment {
     fn from(offering: Offering) -> Self {
         Self::new(offering.id, offering.title)
     }
 }
 
-struct Appointments(Vec<Appointment>);
-impl Display for Appointments {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", &self.0.iter().map(|a| a.to_string()).collect::<Vec<String>>().join(" || "))
-    }
-}
-
-impl Deref for Appointments {
-    type Target = Vec<Appointment>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for Appointments {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-struct NotificationConfig {
-    twilio_sid: String,
-    twilio_token: String,
-    phone_to: String,
-    phone_from: String,
-    sms_endpoint: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting Version V0.0.2");
+    println!("Starting Version V0.0.3");
 
     let config = NotificationConfig {
-        twilio_sid: std::env::var("TWILIO_SID").unwrap(),
-        twilio_token: std::env::var("TWILIO_TOKEN").unwrap(),
-        phone_to: std::env::var("PHONE_TO").unwrap(),
-        phone_from: std::env::var("PHONE_FROM").unwrap(),
-        sms_endpoint: format!(
-            "https://api.twilio.com/2010-04-01/Accounts/{}/Messages.json",
-            std::env::var("TWILIO_SID").unwrap()
-        ),
+        telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID must be set"),
+        telegram_token: std::env::var("TELEGRAM_TOKEN").expect("TELEGRAM_TOKEN must be set"),
     };
 
     let client = reqwest::Client::new();
@@ -118,8 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn check_offerings(
     notification_map: &mut HashMap<u64, HashSet<String>>,
-) -> Result<Option<Appointments>, Box<dyn std::error::Error>> {
-    let mut appointments = Appointments(Vec::new());
+) -> Result<Option<Vec<Appointment>>, Box<dyn std::error::Error>> {
+    let mut appointments = Vec::new();
 
     let offerings =
         reqwest::get("https://booking-service.jameda.de/public/resources/81229096/services")
@@ -185,21 +147,22 @@ async fn check_offerings(
     }
 }
 
-async fn notify(appointments: &Appointments, config: &NotificationConfig, client: &Client) {
+async fn notify(appointments: &[Appointment], config: &NotificationConfig, client: &Client) {
+    let text = appointments.iter().map(|a| {
+        format!("{}: {}", a.title, a.dates.join(","))
+    }).collect::<Vec<String>>().join("\n");
+
     match client
-        .post(&config.sms_endpoint)
-        .basic_auth(&config.twilio_sid, Some(&config.twilio_token))
-        .form(&[
-            ("To", &config.phone_to),
-            ("From", &config.phone_from),
-            ("Body", &appointments.to_string()),
+        .post(format!("https://api.telegram.org/bot{}/sendMessage", config.telegram_token))
+        .query(&[
+            ("chat_id", &config.telegram_chat_id),
+            ("text", &text),
         ])
         .send()
         .await
     {
         Ok(resp) => {
-            println!("Sent notification string: {}", appointments.to_string());
-            println!("Got status code: {}", resp.status());
+            println!("Sent with status code: {}", resp.status());
         }
         Err(e) => {
             println!("Error during sending: {:?}", e)
