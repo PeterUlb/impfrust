@@ -1,10 +1,13 @@
-use chrono::Timelike;
+use chrono::{Timelike, Utc};
 use rand::Rng;
 use reqwest::header;
 use reqwest::header::HeaderValue;
 use reqwest::Client;
 use serde::Deserialize;
+use slog::{debug, error, info, o, warn, Drain, Logger};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -21,7 +24,7 @@ struct DoctorInfoResult {
 #[derive(Deserialize, Debug)]
 struct DoctorInfo {
     ref_id: String,
-    name_nice: String,
+    name_kurz: String,
     entfernung: f64,
     services: Vec<String>,
 }
@@ -82,7 +85,9 @@ type DoctorMap = HashMap<String, ServiceMap>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting Version V0.0.3");
+    let log = init_logger();
+
+    info!(log, "Starting Version V0.0.3");
     dotenv::dotenv().ok();
 
     let config = NotificationConfig {
@@ -104,17 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut doctor_map: DoctorMap = HashMap::new();
     loop {
-        match check_services(&client, &mut doctor_map).await {
+        match check_services(&log, &client, &mut doctor_map).await {
             Ok(option) => match option {
                 None => {
-                    println!("Nothing new...");
+                    info!(log, "No changes compared to last run");
                 }
                 Some(appointments) => {
-                    notify(&appointments, &config, &client).await;
+                    notify(&log, &appointments, &config, &client).await;
                 }
             },
             Err(e) => {
-                println!("Error: {:?}", e);
+                error!(log, "Error: {:?}", e);
             }
         }
         let hour = chrono::Utc::now().hour();
@@ -128,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn check_services(
+    log: &Logger,
     client: &Client,
     notification_map: &mut DoctorMap,
 ) -> Result<Option<Vec<Appointment>>, Box<dyn std::error::Error>> {
@@ -163,11 +169,12 @@ async fn check_services(
             .await
         {
             Ok(srv) => srv,
-            Err(_) => {
-                // The specified refId (1234) does not have OTB available.
-                println!(
-                    "Skipping {}, no appointment bookable",
-                    doctor_info.name_nice
+            Err(e) => {
+                // E.g. The specified refId (1234) does not have OTB available.
+                // Shouldn't happen anymore since we use "otb_status"
+                warn!(
+                    log,
+                    "Skipping {}, no appointment bookable ({})", doctor_info.name_kurz, e
                 );
                 continue;
             }
@@ -181,12 +188,14 @@ async fn check_services(
             }
             // Be nice and slow down
             sleep(Duration::from_millis(2000)).await;
-            println!(
+            info!(
+                log,
                 "Checking {} from {} ({}km)",
-                service.title, doctor_info.name_nice, doctor_info.entfernung
+                service.title,
+                doctor_info.name_kurz,
+                doctor_info.entfernung
             );
 
-            // Also possible: {"code":2000,"message":"There are no open slots, because all slots have been booked already."}
             let slots: Vec<Slot> = match client
                 .get(format!(
                     "https://booking-service.jameda.de/public/resources/{}/slots?serviceId={}",
@@ -200,17 +209,18 @@ async fn check_services(
                 Ok(response_string) => match serde_json::from_str(&response_string) {
                     Ok(slots) => slots,
                     Err(e) => {
+                        // Also possible: {"code":2000,"message":"There are no open slots, because all slots have been booked already."}
                         let status: StatusCode =
                             serde_json::from_str(&response_string).unwrap_or(StatusCode {
                                 code: 500,
                                 message: e.to_string(),
                             });
-                        println!("{:?}", status);
+                        info!(log, "{:?}", status);
                         continue;
                     }
                 },
                 Err(e) => {
-                    println!("Skipping due to error {:?}", e);
+                    error!(log, "Skipping due to error {:?}", e);
                     continue;
                 }
             };
@@ -223,7 +233,7 @@ async fn check_services(
 
             let mut appointment = Appointment::new(
                 doctor_info.ref_id.clone(),
-                doctor_info.name_nice.to_owned(),
+                doctor_info.name_kurz.to_owned(),
                 doctor_info.entfernung,
                 service.id,
                 service.title,
@@ -260,8 +270,8 @@ async fn check_services(
     }
 
     // Set all found entries as old entries, so new ones can be reported
-    println!("OLD: {:?}", notification_map);
-    println!("NEW: {:?}", notification_map_new);
+    info!(log, "OLD: {:?}", notification_map);
+    info!(log, "NEW: {:?}", notification_map_new);
     *notification_map = notification_map_new;
 
     if appointments.is_empty() {
@@ -271,7 +281,12 @@ async fn check_services(
     }
 }
 
-async fn notify(appointments: &[Appointment], config: &NotificationConfig, client: &Client) {
+async fn notify(
+    log: &Logger,
+    appointments: &[Appointment],
+    config: &NotificationConfig,
+    client: &Client,
+) {
     let text = appointments
         .iter()
         .map(|a| {
@@ -286,7 +301,7 @@ async fn notify(appointments: &[Appointment], config: &NotificationConfig, clien
         .collect::<Vec<String>>()
         .join("\n");
 
-    println!("Sending: {}", text);
+    info!(log, "Sending: {}", text);
 
     match client
         .post(format!(
@@ -298,10 +313,21 @@ async fn notify(appointments: &[Appointment], config: &NotificationConfig, clien
         .await
     {
         Ok(resp) => {
-            println!("Sent with status code: {}", resp.status());
+            info!(log, "Sent with status code: {}", resp.status());
         }
         Err(e) => {
-            println!("Error during sending: {:?}", e)
+            error!(log, "Error during sending: {:?}", e)
         }
     }
+}
+
+fn init_logger() -> Logger {
+    let decorator = slog_term::TermDecorator::new().build();
+    let drain = Mutex::new(
+        slog_term::FullFormat::new(decorator)
+            .use_custom_timestamp(|f: &mut dyn Write| write!(f, "{}", Utc::now().to_string()))
+            .build(),
+    )
+    .fuse();
+    slog::Logger::root(drain, o!())
 }
