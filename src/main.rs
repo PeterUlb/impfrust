@@ -1,4 +1,5 @@
-use chrono::{Timelike, Utc};
+use chrono::{SubsecRound, Timelike, Utc};
+use clap::{App, Arg};
 use rand::Rng;
 use reqwest::header;
 use reqwest::header::HeaderValue;
@@ -6,6 +7,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use slog::{debug, error, info, o, warn, Drain, Logger};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
 use std::io::Write;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,6 +16,15 @@ use tokio::time::sleep;
 struct NotificationConfig {
     telegram_chat_id: String,
     telegram_token: String,
+}
+
+impl Debug for NotificationConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotificationConfig")
+            .field("telegram_chat_id", &self.telegram_chat_id)
+            .field("telegram_token", &"**************")
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -79,6 +90,14 @@ impl Appointment {
     }
 }
 
+#[derive(Debug)]
+struct Config {
+    latitude: f64,
+    longitude: f64,
+    radius: u64,
+    notification_config: NotificationConfig,
+}
+
 type Date = String;
 type ServiceMap = HashMap<u64, HashSet<Date>>;
 type DoctorMap = HashMap<String, ServiceMap>;
@@ -86,14 +105,11 @@ type DoctorMap = HashMap<String, ServiceMap>;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log = init_logger();
-
     info!(log, "Starting Version V0.0.3");
+
     dotenv::dotenv().ok();
 
-    let config = NotificationConfig {
-        telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").expect("TELEGRAM_CHAT_ID must be set"),
-        telegram_token: std::env::var("TELEGRAM_TOKEN").expect("TELEGRAM_TOKEN must be set"),
-    };
+    let config = get_config(&log);
 
     let mut headers = header::HeaderMap::new();
     headers.insert(
@@ -109,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut doctor_map: DoctorMap = HashMap::new();
     loop {
-        match check_services(&log, &client, &mut doctor_map).await {
+        match check_services(&log, &config, &client, &mut doctor_map).await {
             Ok(option) => match option {
                 None => {
                     info!(log, "No changes compared to last run");
@@ -134,18 +150,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn check_services(
     log: &Logger,
+    config: &Config,
     client: &Client,
     notification_map: &mut DoctorMap,
 ) -> Result<Option<Vec<Appointment>>, Box<dyn std::error::Error>> {
     let mut appointments = Vec::new();
     let mut notification_map_new = HashMap::new();
 
-    //https://www.jameda.de/heidelberg/corona-impftermine/spezialisten/?ajaxparams[0]=add|popular|otb_status&ajaxparams[1]=change|geoball|49.39875_8.672434_100&output=json
     let relevant_doctor_info = client
         .get("https://www.jameda.de/heidelberg/corona-impftermine/spezialisten/")
         .query(&[
             ("ajaxparams[0]", "add|popular|otb_status"),
-            ("ajaxparams[1]", "change|geoball|49.39875_8.672434_150"),
+            (
+                "ajaxparams[1]",
+                &format!(
+                    "change|geoball|{}_{}_{}",
+                    config.latitude, config.longitude, config.radius
+                ),
+            ),
             ("output", "json"),
         ])
         .send()
@@ -181,8 +203,10 @@ async fn check_services(
         };
 
         for service in services {
-            if !service.title.to_lowercase().contains("impfung")
-                || service.title.to_lowercase().contains("zweit")
+            let title_lower = service.title.to_lowercase();
+            if !title_lower.contains("impfung")
+                || !title_lower.contains("corona")
+                || title_lower.contains("zweit")
             {
                 continue;
             }
@@ -281,12 +305,7 @@ async fn check_services(
     }
 }
 
-async fn notify(
-    log: &Logger,
-    appointments: &[Appointment],
-    config: &NotificationConfig,
-    client: &Client,
-) {
+async fn notify(log: &Logger, appointments: &[Appointment], config: &Config, client: &Client) {
     let text = appointments
         .iter()
         .map(|a| {
@@ -306,9 +325,12 @@ async fn notify(
     match client
         .post(format!(
             "https://api.telegram.org/bot{}/sendMessage",
-            config.telegram_token
+            config.notification_config.telegram_token
         ))
-        .query(&[("chat_id", &config.telegram_chat_id), ("text", &text)])
+        .query(&[
+            ("chat_id", &config.notification_config.telegram_chat_id),
+            ("text", &text),
+        ])
         .send()
         .await
     {
@@ -325,9 +347,63 @@ fn init_logger() -> Logger {
     let decorator = slog_term::TermDecorator::new().build();
     let drain = Mutex::new(
         slog_term::FullFormat::new(decorator)
-            .use_custom_timestamp(|f: &mut dyn Write| write!(f, "{}", Utc::now().to_string()))
+            .use_custom_timestamp(|f: &mut dyn Write| {
+                write!(f, "{}", Utc::now().round_subsecs(3).to_rfc3339())
+            })
             .build(),
     )
     .fuse();
     slog::Logger::root(drain, o!())
+}
+
+fn get_config(log: &Logger) -> Config {
+    let matches = App::new("Jameda Impfhelper")
+        .version("0.0.3")
+        .arg(
+            Arg::new("latitude")
+                .long("lat")
+                .value_name("COORDINATE")
+                .about("Sets the latitude of the search start point, e.g. 49.1234567")
+                .required(true),
+        )
+        .arg(
+            Arg::new("longitude")
+                .long("long")
+                .value_name("COORDINATE")
+                .about("Sets the longitude of the search start point, e.g. 8.9876543")
+                .required(true),
+        )
+        .arg(
+            Arg::new("radius")
+                .long("radius")
+                .value_name("NUMBER")
+                .about("Sets the search radius, e.g. 100")
+                .default_value("100"),
+        )
+        .get_matches();
+
+    let latitude = matches
+        .value_of_t("latitude")
+        .expect("Latitude isn't a number");
+    let longitude = matches
+        .value_of_t("longitude")
+        .expect("Longitude isn't a number");
+    let radius = matches.value_of_t("radius").expect("Radius isn't a number");
+
+    let notification_config = NotificationConfig {
+        telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID")
+            .expect("TELEGRAM_CHAT_ID env var must be set"),
+        telegram_token: std::env::var("TELEGRAM_TOKEN")
+            .expect("TELEGRAM_TOKEN env var must be set"),
+    };
+
+    let config = Config {
+        latitude,
+        longitude,
+        radius,
+        notification_config,
+    };
+    debug!(log, "Using Config: {:?}", config);
+
+    config
 }

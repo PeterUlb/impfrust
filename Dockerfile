@@ -1,15 +1,9 @@
-FROM rust:1.52
-
-# Copy local code to the container image.
-WORKDIR /usr/src/app
+FROM rust:1.52 as builder
+WORKDIR app
 COPY . .
+RUN cargo build --release --bin impfrust
 
-# Install production dependencies and build a release artifact.
-RUN cargo install --path .
-
-# Service must listen to $PORT environment variable.
-# This default value facilitates local development.
-ENV PORT 8080
-
-# Run the web service on container startup.
-CMD ["impfrust"]
+FROM rust:1.52 as runtime
+WORKDIR app
+COPY --from=builder /app/target/release/impfrust /usr/local/bin/impfrust
+ENTRYPOINT ["impfrust", "--lat", "49.39875", "--long", "8.672434", "--radius", "150"]
