@@ -176,7 +176,16 @@ async fn check_services(
         .await?;
 
     for doctor_info in relevant_doctor_info.results {
-        if !doctor_info.services.contains(&"Corona-Impfung".to_owned()) {
+        let offers_vaccination = doctor_info
+            .services
+            .iter()
+            .any(|entry| entry.to_lowercase().contains("corona-impfung"));
+
+        if !offers_vaccination {
+            debug!(
+                log,
+                "{} does not offer any vaccination", doctor_info.name_kurz
+            );
             continue;
         }
 
@@ -263,17 +272,19 @@ async fn check_services(
                 service.title,
             );
             for date in dates {
-                // Check if the date for the service/appointment id was already reported as available, if not, add it
+                // Check if the date for the service/appointment id was already reported as available, if not, add it and add to return values
                 let notification_entries = notification_map
                     .entry(doctor_info.ref_id.clone())
                     .or_insert_with(HashMap::new)
                     .entry(appointment.service_id)
                     .or_insert_with(HashSet::new);
                 if notification_entries.insert(date.clone()) {
-                    // Wasn't reported yet, add it
+                    // Wasn't reported yet nor is it in the new return value, add it
                     appointment.dates.push(date.clone());
                 }
 
+                // Every entry must be added to the map of the current run. This one will be used for comparision in the next run
+                // (relevant e.g. if old map contained dates that aren't available in the new run, but might be available later again)
                 notification_map_new
                     .entry(doctor_info.ref_id.clone())
                     .or_insert_with(HashMap::new)
@@ -294,7 +305,6 @@ async fn check_services(
     }
 
     // Set all found entries as old entries, so new ones can be reported
-    info!(log, "OLD: {:?}", notification_map);
     info!(log, "NEW: {:?}", notification_map_new);
     *notification_map = notification_map_new;
 

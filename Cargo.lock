@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "impfrust"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "chrono",
  "clap",

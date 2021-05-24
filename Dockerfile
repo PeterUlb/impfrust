@@ -1,9 +1,9 @@
 FROM rust:1.52 as builder
-WORKDIR app
+WORKDIR /usr/src/impfrust
 COPY . .
-RUN cargo build --release --bin impfrust
+RUN cargo install --path .
 
-FROM rust:1.52 as runtime
-WORKDIR app
-COPY --from=builder /app/target/release/impfrust /usr/local/bin/impfrust
+FROM debian:buster-slim as runtime
+RUN apt-get update && apt-get install -y ca-certificates
+COPY --from=builder /usr/local/cargo/bin/impfrust /usr/local/bin/impfrust
 ENTRYPOINT ["impfrust", "--lat", "49.39875", "--long", "8.672434", "--radius", "150"]
