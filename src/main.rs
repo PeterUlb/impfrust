@@ -47,6 +47,18 @@ struct Service {
 }
 
 #[derive(Deserialize, Debug)]
+struct Module {
+    #[serde(rename = "type")]
+    type_: String, //knownPatient
+    services: Vec<u64>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ModuleItems {
+    items: Vec<Module>,
+}
+
+#[derive(Deserialize, Debug)]
 struct StatusCode {
     code: u64,
     message: String,
@@ -176,6 +188,11 @@ async fn check_services(
         .await?;
 
     for doctor_info in relevant_doctor_info.results {
+        debug!(
+            log,
+            "Checking {}, {}km", doctor_info.name_kurz, doctor_info.entfernung
+        );
+
         let offers_vaccination = doctor_info
             .services
             .iter()
@@ -188,6 +205,33 @@ async fn check_services(
             );
             continue;
         }
+
+        // Be nice and slow down
+        sleep(Duration::from_millis(2000)).await;
+
+        let services_for_patients = client
+            .get(format!(
+                "https://booking-service.jameda.de/public/config/modules?refId={}",
+                doctor_info.ref_id
+            ))
+            .send()
+            .await?
+            .json::<ModuleItems>()
+            .await
+            .map(|module_items| {
+                module_items
+                    .items
+                    .iter()
+                    .find(|&module| module.type_ == "knownPatient")
+                    .map(|a| a.services.clone())
+                    .unwrap_or_else(Vec::new)
+            })
+            .unwrap_or_else(|_| Vec::new());
+
+        debug!(
+            log,
+            "Services {:?} are reserved for existing patients", services_for_patients
+        );
 
         let services = match client
             .get(format!(
@@ -219,8 +263,14 @@ async fn check_services(
             {
                 continue;
             }
-            // Be nice and slow down
-            sleep(Duration::from_millis(2000)).await;
+            if services_for_patients.contains(&service.id) {
+                debug!(
+                    log,
+                    "Skipping {} as it is reserved for patients", service.title
+                );
+                continue;
+            }
+
             info!(
                 log,
                 "Checking {} from {} ({}km)",
