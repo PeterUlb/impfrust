@@ -117,7 +117,6 @@ type DoctorMap = HashMap<String, ServiceMap>;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log = init_logger();
-    info!(log, "Starting Version V0.0.3");
 
     dotenv::dotenv().ok();
 
@@ -134,6 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .default_headers(headers)
         .build()
         .unwrap();
+
+    send_start_info(&log, &config, &client).await;
 
     let mut doctor_map: DoctorMap = HashMap::new();
     loop {
@@ -160,6 +161,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+async fn send_start_info(log: &Logger, config: &Config, client: &Client) {
+    let text = format!(
+        "Starting Version 0.0.4 (Only mRNA) at {}/{}, {}km radius",
+        config.latitude, config.longitude, config.radius
+    );
+    info!(log, "{}", text);
+
+    send_text(client, config, &text, log).await;
+}
+
 async fn check_services(
     log: &Logger,
     config: &Config,
@@ -170,7 +181,7 @@ async fn check_services(
     let mut notification_map_new = HashMap::new();
 
     let relevant_doctor_info = client
-        .get("https://www.jameda.de/heidelberg/corona-impftermine/spezialisten/")
+        .get("https://www.jameda.de/mannheim/corona-impftermine/spezialisten/")
         .query(&[
             ("ajaxparams[0]", "add|popular|otb_status"),
             (
@@ -260,6 +271,12 @@ async fn check_services(
             if !title_lower.contains("impfung")
                 || !title_lower.contains("corona")
                 || title_lower.contains("zweit")
+            {
+                continue;
+            }
+            if !(title_lower.contains("biontech")
+                || title_lower.contains("pfizer")
+                || title_lower.contains("moderna"))
             {
                 continue;
             }
@@ -382,6 +399,10 @@ async fn notify(log: &Logger, appointments: &[Appointment], config: &Config, cli
 
     info!(log, "Sending: {}", text);
 
+    send_text(client, config, &text, log).await;
+}
+
+async fn send_text(client: &Client, config: &Config, text: &str, log: &Logger) {
     match client
         .post(format!(
             "https://api.telegram.org/bot{}/sendMessage",
@@ -389,7 +410,7 @@ async fn notify(log: &Logger, appointments: &[Appointment], config: &Config, cli
         ))
         .query(&[
             ("chat_id", &config.notification_config.telegram_chat_id),
-            ("text", &text),
+            ("text", &text.to_owned()),
         ])
         .send()
         .await
